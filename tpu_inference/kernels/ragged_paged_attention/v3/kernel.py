@@ -1493,6 +1493,16 @@ def static_validate_inputs(
     del v_scale
 
 
+def get_decode_kv_block_bytes() -> int:
+    """KV bytes the decode heuristic fetches per block to saturate HBM."""
+    # Beyond that, a bigger block only pads the last block of every sequence:
+    # on v5e 4 MiB is enough, and 16 MiB is up to ~2x slower for serving-like
+    # context lengths.
+    if jax.devices()[0].device_kind == "TPU v5 lite":
+        return 4 * 1024 * 1024
+    return 16 * 1024 * 1024
+
+
 def get_default_block_sizes(
     q_dtype,
     kv_dtype,
@@ -1522,8 +1532,8 @@ def get_default_block_sizes(
     max_q = next_power_of_2(max_num_tokens)
     max_kv = pages_per_seq * page_size
 
-    min_bkv_sz_to_peak = (16 * 1024 * 1024 * kv_packing // 4 // head_dim //
-                          num_kv_heads_x2)
+    min_bkv_sz_to_peak = (get_decode_kv_block_bytes() * kv_packing // 4 //
+                          head_dim // num_kv_heads_x2)
 
     match tpu_version:
         case 5 | 6:
