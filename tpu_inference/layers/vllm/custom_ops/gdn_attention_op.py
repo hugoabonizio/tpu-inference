@@ -72,6 +72,13 @@ def gdn_attention_core_tpu(
     query_start_loc = attn_metadata.query_start_loc
     seq_lens = attn_metadata.seq_lens
     block_tables = attn_metadata.block_tables
+    slot_read_offsets = attn_metadata.mamba_slot_read_offsets
+    if attn_metadata.mamba_request_distribution is not None:
+        # Spec decoding: the GDN windowed segment covers both 1-token
+        # decodes and speculative verify windows, which the batch puts
+        # first (see PersistentBatchManager._reorder_batch); RPA keeps
+        # using `request_distribution`.
+        request_distribution = attn_metadata.mamba_request_distribution
 
     layer_module = fc.no_compile_layers[layer_name]
     vllm_context = get_vllm_model_wrapper_context()
@@ -112,6 +119,16 @@ def gdn_attention_core_tpu(
         conv_state_in = conv_state[:, :kernel_size - 1, :]
     else:
         conv_state_in = conv_state
+
+    # Speculative decoding: the kernel keeps one state checkpoint per verify
+    # window position in the request's group of `num_spec_tokens + 1` slots,
+    # and resumes from `slot_read_offsets` (the last accepted position).
+    num_spec_tokens = 0
+    if slot_read_offsets is not None:
+        spec_config = vllm_context.vllm_config.speculative_config
+        assert spec_config is not None, (
+            "mamba_slot_read_offsets is set without speculative decoding")
+        num_spec_tokens = spec_config.num_speculative_tokens
 
     padded_num_reqs_per_dp = padded_num_reqs // dp_size
 
@@ -196,6 +213,8 @@ def gdn_attention_core_tpu(
          mesh=mesh,
          read_state_indices=read_state_indices_sliced,
          conv1d_gdn_kernel=linear_attention_backend.conv1d_gdn_kernel(),
+         slot_read_offsets=slot_read_offsets,
+         num_spec_tokens=num_spec_tokens,
      )
     if state_len > kernel_size - 1:
         remaining_old_state = conv_state[:, kernel_size - 1:, :]

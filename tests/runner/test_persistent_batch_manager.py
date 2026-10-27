@@ -173,6 +173,41 @@ class TestReorderBatch(unittest.TestCase):
         for rid in result_ids[2:]:
             self.assertGreater(num_scheduled[rid], 1)
 
+    def test_spec_decode_verify_windows_before_prefill(self):
+        """With speculative decoding the batch is ordered as [1-token
+        decodes][verify windows][prefill], so the GDN windowed segment (the
+        first two) is contiguous, while the RPA decode segment stays the
+        1-token decodes."""
+        req_ids = ["p0", "v0", "d0", "p1", "v1", "d1"]
+        num_scheduled = {"p0": 10, "v0": 4, "d0": 1, "p1": 3, "v1": 2, "d1": 1}
+        manager, sched_out = _create_manager(req_ids, num_scheduled)
+        sched_out.scheduled_spec_decode_tokens = {"v0": [7, 8, 9], "v1": [7]}
+
+        manager._reorder_batch(sched_out)
+
+        result_ids = manager.input_batch.req_ids
+        self.assertEqual(sorted(result_ids[:2]), ["d0", "d1"])
+        self.assertEqual(sorted(result_ids[2:4]), ["v0", "v1"])
+        self.assertEqual(sorted(result_ids[4:]), ["p0", "p1"])
+        self.assertEqual(manager.input_batch.request_distribution, [2, 2, 6])
+        for i, rid in enumerate(result_ids):
+            self.assertEqual(manager.input_batch.req_id_to_index[rid], i)
+
+    def test_spec_decode_batched_rpa_short_prefill_after_windows(self):
+        """With batched RPA (max_decode_tokens > 1) a prefill chunk that fits
+        in max_decode_tokens joins the RPA decode segment, but must come after
+        the verify windows so it stays out of the GDN windowed segment."""
+        req_ids = ["p0", "s0", "v0", "d0"]
+        num_scheduled = {"p0": 10, "s0": 2, "v0": 4, "d0": 1}
+        manager, sched_out = _create_manager(req_ids, num_scheduled)
+        manager.input_batch.max_decode_tokens = 4
+        sched_out.scheduled_spec_decode_tokens = {"v0": [7, 8, 9]}
+
+        manager._reorder_batch(sched_out)
+
+        self.assertEqual(manager.input_batch.req_ids, ["d0", "v0", "s0", "p0"])
+        self.assertEqual(manager.input_batch.request_distribution, [3, 3, 4])
+
 
 class TestPersistentBatchManager(unittest.TestCase):
 

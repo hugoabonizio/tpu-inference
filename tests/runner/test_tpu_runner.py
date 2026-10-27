@@ -19,16 +19,49 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.sharding import NamedSharding, PartitionSpec
 from vllm.config import (CacheConfig, ModelConfig, ParallelConfig,
                          SchedulerConfig, SpeculativeConfig, VllmConfig)
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed.aux_output_connector.connector import \
     AuxOutputConnectorMetadata
 
+from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.models.common.interface import (ModelInterface,
                                                    MultiModalInterface)
 from tpu_inference.runner.routed_experts import TPUAuxOutputWorker
 from tpu_inference.runner.tpu_runner import TPUModelRunner
+
+
+def test_update_mamba_slot_read_offsets_scatters_by_slot():
+    """A step's mamba read offsets land on the requests' base slots, so the
+    next step resumes each request from its last accepted checkpoint, and a
+    request that ran no verify window is reset to offset 0."""
+    from tpu_inference.runner.tpu_runner import \
+        _update_mamba_slot_read_offsets_fn
+
+    mesh = jax.make_mesh(
+        (1, ) * 7,
+        ('data', 'pcp', 'attn_dp', 'attn_dp_expert', 'expert', 'model', 'dcp'))
+    sharding = NamedSharding(mesh, PartitionSpec(ShardingAxisName.ATTN_DATA))
+
+    def put(values):
+        return jax.device_put(np.array(values, dtype=np.int32), sharding)
+
+    # Slot 0 is the null block. With 3 speculative tokens each request owns
+    # a group of 4 slots, so the base slots are 1 and 5.
+    slot_read_offsets = put([0, 2, 0, 0, 0, 1, 0, 0, 0])
+    # The request on slot 5 accepted 3 drafts, the one on slot 1 ran a
+    # prefill chunk; the two padded batch positions carry the null slot.
+    mamba_state_indices = put([5, 1, 0, 0])
+    read_offsets = put([3, 0, 0, 0])
+
+    with jax.set_mesh(mesh):
+        out = _update_mamba_slot_read_offsets_fn(slot_read_offsets,
+                                                 mamba_state_indices,
+                                                 read_offsets, mesh)
+
+    np.testing.assert_array_equal(np.asarray(out), [0, 0, 0, 0, 0, 3, 0, 0, 0])
 
 
 class TestTPUJaxRunner:

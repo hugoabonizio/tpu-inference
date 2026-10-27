@@ -728,6 +728,95 @@ def test_mtp_performance(
     )
 
 
+def test_mtp_correctness_with_rejected_drafts(monkeypatch: pytest.MonkeyPatch):
+    '''
+    MTP on a hybrid GDN model must roll back the linear-attention state of
+    rejected draft tokens. The prompts of test_mtp_correctness are accepted
+    almost entirely, so they do not exercise the rollback; these open-ended
+    prompts get many drafts rejected.
+
+    Greedy speculative outputs must match the non-speculative ones, except
+    where two candidates are (near-)tied: bf16 ties and batch-dependent
+    numerics can flip those. So at the first divergence of each output, the
+    speculative token must be within `max_logprob_gap` of the reference token
+    in the reference distribution. Without rollback the outputs diverge
+    within a few tokens onto tokens far below the reference argmax.
+    '''
+    model_name = "Qwen/Qwen3.5-4B"
+    monkeypatch.setenv("MODEL_IMPL_TYPE", "vllm")
+    monkeypatch.setenv("DRAFT_MODEL_IMPL_TYPE", "vllm")
+    max_logprob_gap = 0.5
+    prompts = [
+        "Explain in 5 sentences what a TPU is.",
+        "Write a Python function that checks whether a number is prime.",
+        "List the planets of the solar system in order from the Sun.",
+        "Summarize the plot of Romeo and Juliet in one paragraph.",
+        "Write a haiku about the ocean.",
+        "What are the main differences between TCP and UDP?",
+    ]
+    kwargs = {
+        "seed": 42,
+        "max_model_len": 512,
+        "max_num_seqs": len(prompts),
+        "max_num_batched_tokens": 1024,
+        "enable_prefix_caching": False,
+        "gpu_memory_utilization": 0.90,
+        "tensor_parallel_size": _get_tensor_parallel_size(),
+        "disable_log_stats": False,
+        # Text-only prompts: skip compiling the vision tower.
+        "limit_mm_per_prompt": {
+            "image": 0,
+            "video": 0
+        },
+    }
+    ref_params = SamplingParams(temperature=0,
+                                max_tokens=96,
+                                ignore_eos=True,
+                                logprobs=5)
+    spec_params = SamplingParams(temperature=0, max_tokens=96, ignore_eos=True)
+
+    ref_llm = LLM(model=model_name, max_logprobs=5, **kwargs)
+    ref_outputs = [o.outputs[0] for o in ref_llm.generate(prompts, ref_params)]
+    ref_llm.llm_engine.engine_core.shutdown()
+
+    spec_llm = LLM(model=model_name,
+                   speculative_config={
+                       "method": "mtp",
+                       "num_speculative_tokens": 3,
+                   },
+                   **kwargs)
+    spec_outputs = [
+        o.outputs[0] for o in spec_llm.generate(prompts, spec_params)
+    ]
+    num_draft_tokens = num_accepted_tokens = 0
+    for metric in spec_llm.get_metrics():
+        if metric.name == "vllm:spec_decode_num_draft_tokens":
+            num_draft_tokens += metric.value
+        elif metric.name == "vllm:spec_decode_num_accepted_tokens":
+            num_accepted_tokens += metric.value
+    spec_llm.llm_engine.engine_core.shutdown()
+
+    print(f"Accepted {num_accepted_tokens} of {num_draft_tokens} drafts.")
+    assert 0 < num_accepted_tokens < num_draft_tokens, (
+        "Expected some, but not all, draft tokens to be accepted")
+
+    for prompt, ref, spec in zip(prompts, ref_outputs, spec_outputs):
+        ref_ids, spec_ids = list(ref.token_ids), list(spec.token_ids)
+        if ref_ids == spec_ids:
+            continue
+        pos = next(i for i, (r, s) in enumerate(zip(ref_ids, spec_ids))
+                   if r != s)
+        ref_logprobs = ref.logprobs[pos]
+        gap = (ref_logprobs[ref_ids[pos]].logprob -
+               ref_logprobs[spec_ids[pos]].logprob
+               if spec_ids[pos] in ref_logprobs else float("inf"))
+        print(f"{prompt!r} diverges at token {pos} with logprob gap {gap}\n"
+              f"ref_output: {ref.text}\nspec_output: {spec.text}")
+        assert gap <= max_logprob_gap, (
+            f"{prompt!r}: speculative output diverges at token {pos} onto a "
+            f"token {gap:.3f} below the reference token")
+
+
 def test_eagle3_logprobs_correctness(monkeypatch: pytest.MonkeyPatch, ):
     """Reproduction test for speculative decoding with logprobs enabled."""
     model_name = 'meta-llama/Meta-Llama-3-8B-Instruct'
