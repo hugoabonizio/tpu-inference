@@ -27,6 +27,8 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     read_indices: jax.Array,
+    conv_read_indices: jax.Array,
+    conv_state_indices: jax.Array,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing multiple sequences per tile.
 
@@ -60,6 +62,8 @@ def compute_batched_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_read_indices=read_indices,
+        s_idx_to_conv_read_indices=conv_read_indices,
+        s_idx_to_conv_state_indices=conv_state_indices,
     )
 
 
@@ -71,6 +75,8 @@ def compute_per_seq_metadata(
     start_seq: jax.Array,
     end_seq: jax.Array,
     read_indices: jax.Array,
+    conv_read_indices: jax.Array,
+    conv_state_indices: jax.Array,
 ) -> memory_ref.MetadataRef:
     """Metadata for computing single sequence per tile."""
 
@@ -84,6 +90,8 @@ def compute_per_seq_metadata(
     seq_lens = jnp.roll(seq_lens, shift=-start_seq)
     state_indices = jnp.roll(state_indices, shift=-start_seq)
     read_indices = jnp.roll(read_indices, shift=-start_seq)
+    conv_read_indices = jnp.roll(conv_read_indices, shift=-start_seq)
+    conv_state_indices = jnp.roll(conv_state_indices, shift=-start_seq)
 
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     # NOTE: query_lens is used for calculating num_tiles. Defensive programming
@@ -149,4 +157,6 @@ def compute_per_seq_metadata(
         # Prefill/mixed sequences always resume from the group's base slot.
         s_idx_to_read_offset=jnp.zeros_like(state_indices),
         s_idx_to_read_indices=read_indices,
+        s_idx_to_conv_read_indices=conv_read_indices,
+        s_idx_to_conv_state_indices=conv_state_indices,
     )
