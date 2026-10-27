@@ -41,6 +41,14 @@ class PersistentBatchManager:
         (decode_only, fixed_chunked_prefill_only, mixed) and set the request
         distribution accordingly.
 
+        The batch is ordered as [1-token decodes][speculative verify
+        windows][other requests within `max_decode_tokens`][prefill/mixed].
+        Ragged paged attention's decode segment is the requests within
+        `max_decode_tokens`, a prefix of this order. The GDN kernel's
+        windowed mode covers the first two segments, which must be contiguous
+        and must not contain prefill chunks (see
+        `AttentionMetadata.mamba_request_distribution`).
+
         Returns:
             The number of swaps in requests.
         """
@@ -59,44 +67,46 @@ class PersistentBatchManager:
             ]
             return swap_cnt
 
-        # Check if all scheduled requests match the decode threshold
-        all_decode = True
-        for req_id in self.input_batch.req_ids[:num_reqs]:
-            if scheduler_output.num_scheduled_tokens[
-                    req_id] > max_decode_tokens:
-                all_decode = False
-                break
+        spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
 
-        if all_decode:
-            num_decode = num_reqs
-            self.input_batch.request_distribution = [
-                num_decode, num_decode, num_reqs
-            ]
-            return swap_cnt
+        def segment(req_id: str) -> int:
+            num_tokens = scheduler_output.num_scheduled_tokens[req_id]
+            if num_tokens == 1:
+                return 0
+            if req_id in spec_decode_tokens:
+                return 1
+            if num_tokens <= max_decode_tokens:
+                return 2
+            return 3
 
-        # Use two-pointer approach to reorder the decode requests to front.
-        i, j = 0, num_reqs - 1
-        while i < j:
-            i_req_id = self.input_batch.req_ids[i]
-            j_req_id = self.input_batch.req_ids[j]
-
-            if scheduler_output.num_scheduled_tokens[
-                    i_req_id] <= max_decode_tokens:
-                # i is a decode request, move to the next one.
+        def partition(start: int, bound: int) -> int:
+            """Two-pointer partition of [start, num_reqs): requests with
+            segment <= bound go first. Returns the end of that part."""
+            nonlocal swap_cnt
+            i, j = start, num_reqs - 1
+            while i < j:
+                if segment(self.input_batch.req_ids[i]) <= bound:
+                    i += 1
+                elif segment(self.input_batch.req_ids[j]) > bound:
+                    j -= 1
+                else:
+                    self.input_batch.swap_states(i, j)
+                    i += 1
+                    j -= 1
+                    swap_cnt += 1
+            if i == j and segment(self.input_batch.req_ids[i]) <= bound:
                 i += 1
-            elif scheduler_output.num_scheduled_tokens[
-                    j_req_id] > max_decode_tokens:
-                # j is a prefill request, move to the previous one.
-                j -= 1
-            else:
-                # Swap i and j.
-                self.input_batch.swap_states(i, j)
-                i += 1
-                j -= 1
-                swap_cnt += 1
+            return i
 
-        num_decode = i + int(scheduler_output.num_scheduled_tokens[
-            self.input_batch.req_ids[i]] <= max_decode_tokens)
+        segment_ends = []
+        end = 0
+        for bound in range(3):
+            end = partition(end, bound)
+            segment_ends.append(end)
+        # Verify windows fit in `max_decode_tokens` only when it is above 1
+        # (batched RPA), where segments 1 and 2 join the RPA decode segment.
+        num_decode = (segment_ends[0]
+                      if max_decode_tokens == 1 else segment_ends[2])
 
         self.input_batch.request_distribution = [
             num_decode, num_decode, num_reqs

@@ -50,6 +50,8 @@ def run_jax_gdn_attention(
     mesh: jax.sharding.Mesh,
     read_state_indices: Optional[jnp.ndarray] = None,
     conv1d_gdn_kernel: Optional[Conv1dGDNKernel] = None,
+    slot_read_offsets: Optional[jnp.ndarray] = None,
+    num_spec_tokens: int = 0,
 ) -> Tuple[Tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
     """Runs the Jax GDN attention mechanism.
 
@@ -92,6 +94,13 @@ def run_jax_gdn_attention(
           checkpoints into the block covering its current position.
         conv1d_gdn_kernel: The linear attention backend's fused conv1d + GDN
           kernel. Defaults to the GDN v3 kernel.
+        slot_read_offsets: Optional `(num_blocks,)` per-slot mamba read offset
+          for speculative decoding (`num_accepted - 1` of the slot's last
+          verify step), gathered per request as
+          `slot_read_offsets[state_indices]`. Required iff
+          `num_spec_tokens > 0`.
+        num_spec_tokens: Number of speculative draft tokens. 0 disables the
+          kernel's windowed verify mode.
 
     Returns:
         A tuple containing:
@@ -102,6 +111,8 @@ def run_jax_gdn_attention(
     """
     if read_state_indices is None:
         read_state_indices = state_indices
+    assert (num_spec_tokens > 0) == (slot_read_offsets is not None), (
+        "slot_read_offsets must be given iff num_spec_tokens > 0")
 
     in_specs = (
         P(ShardingAxisName.ATTN_DATA,
@@ -122,6 +133,10 @@ def run_jax_gdn_attention(
         P(ShardingAxisName.ATTN_DATA),  # distribution
         P(ShardingAxisName.ATTN_DATA),  # seq_lens
         P(ShardingAxisName.ATTN_DATA),  # read_state_indices
+        # slot_read_offsets is optional: when absent it is passed as None
+        # with a matching None spec.
+        P(ShardingAxisName.ATTN_DATA)
+        if slot_read_offsets is not None else None,  # slot_read_offsets
     )
 
     out_specs = (
@@ -136,7 +151,7 @@ def run_jax_gdn_attention(
 
     tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
 
-    p_run_jax_gdn_attention_local = functools.partial(
+    kernel = functools.partial(
         conv1d_gdn_kernel or GDNLinearAttentionBackend().conv1d_gdn_kernel(),
         n_kq=n_kq // tp_size,
         n_v=n_v // tp_size,
@@ -144,6 +159,23 @@ def run_jax_gdn_attention(
         d_v=d_v,
         kernel_size=kernel_size,
     )
+
+    def p_run_jax_gdn_attention_local(j_mixed_qkv, j_b, j_a, conv_state,
+                                      recurrent_state, j_conv_weight,
+                                      j_conv_bias, j_A_log, j_dt_bias,
+                                      query_start_loc, state_indices,
+                                      distribution, seq_lens,
+                                      read_state_indices, slot_read_offsets):
+        args = (j_mixed_qkv, j_b, j_a, conv_state, recurrent_state,
+                j_conv_weight, j_conv_bias, j_A_log, j_dt_bias,
+                query_start_loc, state_indices, distribution, seq_lens,
+                read_state_indices)
+        if slot_read_offsets is None:
+            return kernel(*args)
+        # `state_indices` are rank-local base slots and `slot_read_offsets`
+        # is the rank-local shard of the per-slot offset buffer.
+        read_offsets = slot_read_offsets[state_indices]
+        return kernel(*args, read_offsets, num_spec_tokens=num_spec_tokens)
 
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_local,
@@ -168,6 +200,7 @@ def run_jax_gdn_attention(
         distribution,
         seq_lens,
         read_state_indices,
+        slot_read_offsets,
     )
 
     (new_conv_state, new_recurrent_state), output = mapped_fn(*mapped_args)
