@@ -792,6 +792,18 @@ class GetDefaultBlockSizesTest(parameterized.TestCase):
         self.assertEqual(bs["bq_sz"], 1)
         self.assertEqual(bs["bq_csz"], 1)
 
+    @parameterized.parameters((16 * 1024 * 1024, 16384),
+                              (4 * 1024 * 1024, 8192))
+    def test_decode_kv_block_follows_block_bytes(self, block_bytes, bkv_sz):
+        # 8 q / 1 kv head, head_dim 128, bf16: 512 B of KV per token, and the
+        # block is clamped to the 16384-token max context.
+        with mock.patch.object(self._k,
+                               "get_decode_kv_block_bytes",
+                               return_value=block_bytes):
+            bs = self._call(self._k.RpaCase.DECODE)
+        self.assertEqual(bs["bkv_sz"], bkv_sz)
+        self.assertEqual(bs["bkv_csz"], bkv_sz)
+
     def test_all_cases_return_four_aligned_blocks(self):
         for case in (self._k.RpaCase.DECODE, self._k.RpaCase.PREFILL,
                      self._k.RpaCase.MIXED):
