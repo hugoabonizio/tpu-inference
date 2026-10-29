@@ -275,15 +275,36 @@ def get_kv_cache_shape(
     )
 
 
-def _ragged_paged_attention_kernel(*args, **kwargs):
+def _ragged_paged_attention_kernel(*args,
+                                   num_cores: int = 1,
+                                   core_split: str = "seq",
+                                   **kwargs):
     distribution_ref = args[3]
     start_seq_idx, end_seq_idx = kwargs["case"].get_range(distribution_ref)
+    # Megacore (num_cores > 1): the grid axis is split across the TensorCores
+    # and each core runs its own DMA pipeline, either over the sequences
+    # start + c, start + c + num_cores, ... (core_split="seq": interleaved, so
+    # long and short sequences spread across the cores) or over every sequence
+    # for its own slice of the kv heads (core_split="kv_head": balanced even
+    # for a single long prefill).
+    seq_step, head_core, num_head_cores = 1, 0, 1
+    if num_cores > 1 and core_split == "seq":
+        start_seq_idx = start_seq_idx + pl.program_id(0)
+        seq_step = num_cores
+    elif num_cores > 1:
+        head_core, num_head_cores = pl.program_id(0), num_cores
 
-    @pl.loop(start_seq_idx, end_seq_idx)
+    @pl.loop(start_seq_idx, end_seq_idx, step=seq_step)
     def _(seq_idx):
         return _ragged_paged_attention_kernel_loop(
             seq_idx,
             *args,
+            start_seq_idx=start_seq_idx,
+            end_seq_idx=end_seq_idx,
+            seq_step=seq_step,
+            reset_state=num_cores > 1,
+            head_core=head_core,
+            num_head_cores=num_head_cores,
             **kwargs,
         )
 
@@ -316,6 +337,12 @@ def _ragged_paged_attention_kernel_loop(
     m_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, 128],
     acc_ref,  # [actual_num_kv_heads, bq_sz * num_q_heads_per_kv_head, head_dim],
     *,
+    start_seq_idx,  # first sequence of this core
+    end_seq_idx,
+    seq_step: int = 1,  # next sequence of this core is seq_idx + seq_step
+    reset_state: bool = False,  # fresh pipeline state in the prologue
+    head_core=0,  # with num_head_cores > 1: this core's slice of the kv heads
+    num_head_cores: int = 1,
     use_causal_mask: bool = True,
     update_kv_cache: bool = True,  # KV-share: False = skip cache writes
     skip_kv_mask: bool = False,
@@ -374,8 +401,28 @@ def _ragged_paged_attention_kernel_loop(
     assert head_dim % 128 == 0
     assert bkv_sz % page_size == 0
     bkv_p = bkv_sz // page_size
-    start_seq_idx, end_seq_idx = case.get_range(distribution_ref)
     num_seqs = end_seq_idx - start_seq_idx
+
+    # kv-head split: this core attends kv heads [head_off, head_off + L) into
+    # the leading L entries of its scratch, and moves only their packed rows.
+    split_heads = num_head_cores > 1
+    local_kv_heads = actual_num_kv_heads // num_head_cores
+    local_packs = num_kv_heads_x2_per_kv_packing // num_head_cores
+    head_off = head_core * local_kv_heads
+    pack_off = head_core * local_packs
+
+    def _kv_rows(ref, start, size):
+        # rows of a [tokens, num_kv_heads_x2 // kv_packing, ...] ref
+        if split_heads:
+            return ref.at[pl.ds(start, size), pl.ds(pack_off, local_packs)]
+        return ref.at[pl.ds(start, size)]
+
+    def _q_rows(ref, start, size, *, local=False):
+        # tokens of a [num_kv_heads, tokens, ...] ref
+        if split_heads:
+            return ref.at[pl.ds(0 if local else head_off, local_kv_heads),
+                          pl.ds(start, size)]
+        return ref.at[:, pl.ds(start, size)]
 
     q_start = cu_q_lens_ref[seq_idx]
     q_end = cu_q_lens_ref[seq_idx + 1]
@@ -389,7 +436,7 @@ def _ragged_paged_attention_kernel_loop(
         # TODO(jevinjiang): can skip by page_size instead of bkv_sz.
         cur_seq_start_bkv_idx = jnp.maximum(kv_q_gap - sliding_window,
                                             0) // bkv_sz
-        next_seq_idx = jnp.minimum(seq_idx + 1, end_seq_idx - 1)
+        next_seq_idx = jnp.minimum(seq_idx + seq_step, end_seq_idx - 1)
         next_q_start = cu_q_lens_ref[next_seq_idx]
         next_q_end = cu_q_lens_ref[next_seq_idx + 1]
         next_q_len = next_q_end - next_q_start
@@ -548,8 +595,7 @@ def _ragged_paged_attention_kernel_loop(
 
     def _fetch_bkv(seq_idx, bkv_idx, bkv_sem_idx, *, wait=False):
         sem = sems.at[0, bkv_sem_idx]
-        vmem_ref = bkv_x2_ref.at[
-            bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
+        vmem_ref = bkv_x2_ref.at[bkv_sem_idx, :, :local_packs]
 
         cache_hbm_shape = kv_cache_hbm_ref.shape
         cache_hbm_ref = kv_cache_hbm_ref.reshape(
@@ -608,8 +654,8 @@ def _ragged_paged_attention_kernel_loop(
                 page_idx = jnp.minimum(page_indices_offset + i,
                                        num_page_indices - 1)
                 _async_copy(
-                    cache_hbm_ref.at[pl.ds(
-                        page_indices_ref[page_idx] * page_size, sz)],
+                    _kv_rows(cache_hbm_ref,
+                             page_indices_ref[page_idx] * page_size, sz),
                     vmem_ref.at[pl.ds(i * page_size, sz)],
                     sem,
                     wait=False,
@@ -619,7 +665,7 @@ def _ragged_paged_attention_kernel_loop(
             new_kv_len_start = q_end - kv_left_frm_new
             debug_print("[RPA debug] new_kv_len_start={}", new_kv_len_start)
             _async_copy(
-                kv_hbm_ref.at[pl.ds(new_kv_len_start, bkv_sz_frm_new)],
+                _kv_rows(kv_hbm_ref, new_kv_len_start, bkv_sz_frm_new),
                 vmem_ref.at[pl.ds(bkv_sz_frm_cache, bkv_sz_frm_new)],
                 sem,
                 wait,
@@ -641,8 +687,7 @@ def _ragged_paged_attention_kernel_loop(
                          *,
                          wait=False):
         sem = sems.at[3, bkv_sem_idx]
-        vmem_ref = bkv_x2_ref.at[
-            bkv_sem_idx, :, :num_kv_heads_x2_per_kv_packing]
+        vmem_ref = bkv_x2_ref.at[bkv_sem_idx, :, :local_packs]
         bkv_id = offset // bkv_sz
         kv_p_start = offset // page_size
         kv_p_end = cdiv(offset + update_sz, page_size)
@@ -675,11 +720,12 @@ def _ragged_paged_attention_kernel_loop(
 
             _async_copy(
                 vmem_ref.at[pl.ds((p_ignore + i) * page_size + ignore, sz)],
-                cache_hbm_ref.at[pl.ds(
+                _kv_rows(
+                    cache_hbm_ref,
                     page_indices_ref[page_indices_offset + i] * page_size +
                     ignore,
                     sz,
-                )],
+                ),
                 sem,
                 wait,
             )
@@ -695,7 +741,7 @@ def _ragged_paged_attention_kernel_loop(
                 unroll=False,
             )
         else:
-            dst = cache_hbm_ref.at[pl.ds(0, update_sz)]
+            dst = _kv_rows(cache_hbm_ref, 0, update_sz)
             _async_copy(
                 src=dst,
                 dst=dst,
@@ -721,8 +767,8 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] sz={}", sz)
 
         _async_copy(
-            q_hbm_ref.at[:, pl.ds(q_len_start, sz)],
-            vmem_ref.at[:, pl.ds(0, sz)],
+            _q_rows(q_hbm_ref, q_len_start, sz),
+            _q_rows(vmem_ref, 0, sz, local=True),
             sem,
             wait,
         )
@@ -745,8 +791,8 @@ def _ragged_paged_attention_kernel_loop(
         debug_print("[RPA debug] sz={}", sz)
 
         _async_copy(
-            vmem_ref.at[:, pl.ds(0, sz)],
-            o_hbm_ref.at[:, pl.ds(q_len_start, sz)],
+            _q_rows(vmem_ref, 0, sz, local=True),
+            _q_rows(o_hbm_ref, q_len_start, sz),
             sem,
             wait,
         )
@@ -898,7 +944,7 @@ def _ragged_paged_attention_kernel_loop(
             next_bq_idx = bq_idx + 1
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_seq_idx = lax.select(is_last_bq, seq_idx + seq_step, seq_idx)
             next_bq_sem_idx = lax.select(bq_sem_idx == 0, 1, 0)
             return next_seq_idx, next_bq_idx, next_bq_sem_idx
 
@@ -909,7 +955,7 @@ def _ragged_paged_attention_kernel_loop(
             next_bq_idx = lax.select(is_last_bkv, bq_idx + 1, bq_idx)
             is_last_bq = next_bq_idx == num_bq
             next_bq_idx = lax.select(is_last_bq, 0, next_bq_idx)
-            next_seq_idx = lax.select(is_last_bq, seq_idx + 1, seq_idx)
+            next_seq_idx = lax.select(is_last_bq, seq_idx + seq_step, seq_idx)
             next_bkv_sem_idx = lax.select(bkv_sem_idx == 0, 1, 0)
 
             next_bq_start_bkv_idx = 0
@@ -1016,7 +1062,7 @@ def _ragged_paged_attention_kernel_loop(
                     bkv_start = idx * bkv_csz
 
                     for bq_start in range(0, actual_bq_sz, actual_bq_csz):
-                        for kv_head_idx in range(actual_num_kv_heads):
+                        for kv_head_idx in range(local_kv_heads):
                             bk_c, bv_c = load_bkv(
                                 bkv_sem_idx,
                                 kv_head_idx,
@@ -1095,6 +1141,15 @@ def _ragged_paged_attention_kernel_loop(
 
     @pl.when(seq_idx == start_seq_idx)
     def prologue():
+        if reset_state:
+            # Each core starts from a fresh pipeline state (a grid that runs
+            # sequentially on one core would inherit the previous program's).
+            for i in range(3):
+                sem_ids_ref[i] = 0
+            for i in range(4):
+                bo_ids_ref[i] = -1
+            for i in range(6):
+                bkv_update_ids_ref[i] = -1
         start_fetch_bq(seq_idx=start_seq_idx, bq_idx=0, bq_sem_idx=0)
         start_fetch_bkv(seq_idx=start_seq_idx,
                         bkv_idx=cur_seq_start_bkv_idx,
@@ -1104,7 +1159,7 @@ def _ragged_paged_attention_kernel_loop(
     def pipeline():
         process(static_q_len=static_q_len)
 
-    @pl.when(seq_idx == end_seq_idx - 1)
+    @pl.when(seq_idx + seq_step >= end_seq_idx)
     def epilogue():
         for i in range(2):
             wait_send_bo(bo_sem_idx=i)
@@ -1578,6 +1633,8 @@ def get_default_block_sizes(
         "p_block_sizes",
         "m_block_sizes",
         "vmem_limit_bytes",
+        "num_cores",
+        "core_split",
         "debug_mode",
         "disable_bounds_checks",
         "disable_semaphore_checks",
@@ -1620,6 +1677,15 @@ def ragged_paged_attention(
     p_block_sizes: tuple[int, int, int, int] | None = None,
     m_block_sizes: tuple[int, int, int, int] | None = None,
     vmem_limit_bytes: int | None = None,
+    # TensorCores to split the sequences across; None = the device's count
+    # on megacore chips (v4/v5p: 2), 1 elsewhere.
+    num_cores: int | None = None,
+    # How the cores share the work: "seq" (interleaved sequences), "kv_head"
+    # (each core takes num_kv_heads // num_cores kv heads of every sequence;
+    # falls back to "seq" when the heads do not split evenly) or "auto"
+    # ("seq" for the decode-only launch, "kv_head" for prefill and mixed,
+    # where a single long sequence would otherwise keep one core idle).
+    core_split: str = "auto",
     # Debug params.
     debug_mode: bool = False,
     disable_bounds_checks: bool = True,
@@ -1667,6 +1733,10 @@ def ragged_paged_attention(
   """
     q, k, v = queries, keys, values
     tpu_version = get_tpu_version()
+    if num_cores is None:
+        # v7+ exposes each TensorCore as its own device.
+        num_cores = (getattr(jax.devices()[0], "num_cores", 1)
+                     if tpu_version < 7 else 1)
 
     if out_dtype is None:
         out_dtype = jnp.float32 if q.dtype == jnp.float32 else jnp.bfloat16
@@ -1721,6 +1791,22 @@ def ragged_paged_attention(
     ) = q.shape
     page_size = kv_cache.shape[1]
     num_kv_heads_x2_per_kv_packing = kv_cache.shape[2]
+    if core_split not in ("seq", "kv_head", "auto"):
+        raise ValueError(f"{core_split=} must be 'seq', 'kv_head' or 'auto'.")
+    # Each core takes whole kv heads AND whole packs of the cache's packed
+    # rows (K and V of a head are 2 rows, kv_packing rows per pack): with
+    # 4-bit KV (packing 8) a core's first head could otherwise sit in the
+    # other core's pack.
+    heads_split = (actual_num_kv_heads % num_cores == 0
+                   and (2 * actual_num_kv_heads) %
+                   (get_dtype_packing(kv_cache.dtype) * num_cores) == 0)
+
+    def _core_split(case):
+        split = core_split
+        if split == "auto":
+            split = "seq" if case == RpaCase.DECODE else "kv_head"
+        return split if split == "seq" or heads_split else "seq"
+
     max_num_seqs = kv_lens.shape[0]
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
@@ -1829,18 +1915,23 @@ def ragged_paged_attention(
                 bkv_csz=bkv_csz,
                 case=case,
                 debug_mode=debug_mode,
+                num_cores=num_cores,
+                core_split=_core_split(case),
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
                 out_specs=out_specs,
-                grid=(1, ),
+                grid=(num_cores, ),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(
-                # TODO(jevinjiang): since each sequence depends on the previous
-                # one, we need some extra work to support Megacore mode.
-                dimension_semantics=("arbitrary", ),
+                # Megacore: each core pipelines its own share of the work
+                # (interleaved sequences or a slice of the kv heads, see
+                # _ragged_paged_attention_kernel), with its own scratch,
+                # semaphores and scalar state.
+                dimension_semantics=("parallel"
+                                     if num_cores > 1 else "arbitrary", ),
                 vmem_limit_bytes=vmem_limit_bytes,
                 # Paged attention invokes multiple small DMAs for each pages
                 # instead of a single large DMA. Therefore, the overhead of bounds
