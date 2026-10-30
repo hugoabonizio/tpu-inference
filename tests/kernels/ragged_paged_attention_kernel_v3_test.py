@@ -304,6 +304,28 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             decode_range=True,
         )
 
+    def test_ragged_paged_attention_num_cores_should_be_positive(self):
+        dtype = jnp.float32
+        seq_lens = [(192, 328), (128, 180), (64, 255)]
+        num_heads = (32, 8)
+        head_dim = 128
+        page_size = 16
+        num_pages = 1000
+
+        for num_cores in (0, -1):
+            with self.assertRaisesRegex(ValueError,
+                                        "must be a positive integer"):
+                self._test_ragged_paged_attention(
+                    seq_lens,
+                    num_heads,
+                    head_dim,
+                    page_size,
+                    dtype,
+                    dtype,
+                    num_pages,
+                    num_cores=num_cores,
+                )
+
     def _core_split_inputs(self,
                            seq_lens,
                            n_decode,
@@ -313,10 +335,13 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                            page_size=16,
                            head_dim=128,
                            num_pages=1200,
-                           max_num_seq=32):
+                           max_num_seq=32,
+                           shared_prefix_pages=0):
         """Fresh inputs (the kernel donates q/k/v/cache): `seq_lens` as
         [(q_len, kv_len)] with the decode range first, then the static q_len
-        (PREFILL) range, then mixed."""
+        (PREFILL) range, then mixed. The first `shared_prefix_pages` pages of
+        every sequence are the same physical pages (a cached prefix: read by
+        all sequences, written by none)."""
         rng = np.random.default_rng(7)
         num_q_heads, num_kv_heads = num_heads
         kv_packing = get_dtype_packing(kv_dtype)
@@ -328,10 +353,13 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         pages_per_seq = cdiv(max(kv for _, kv in seq_lens), page_size)
         pi = np.zeros((max_num_seq, pages_per_seq), np.int32)
         perm = rng.permutation(num_pages)
-        used = 0
-        for i, (_, kv) in enumerate(seq_lens):
-            n = cdiv(kv, page_size)
-            pi[i, :n] = perm[used:used + n]
+        shared = shared_prefix_pages
+        used = shared
+        for i, (q_len, kv) in enumerate(seq_lens):
+            assert kv - q_len >= shared * page_size
+            n = cdiv(kv, page_size) - shared
+            pi[i, :shared] = perm[:shared]
+            pi[i, shared:shared + n] = perm[used:used + n]
             used += n
         kv_lens = np.zeros(max_num_seq, np.int32)
         kv_lens[:len(seq_lens)] = [kv for _, kv in seq_lens]
@@ -356,34 +384,51 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
                        (4, 2100)], 3, 3),
         ("long_prefill_many_decodes",
          [(1, 200 + 97 * i) for i in range(15)] + [(512, 1800)], 15, 0),
+        ("shared_prefix", [(1, 700), (1, 1300), (1, 255), (64, 900),
+                           (64, 1500)], 3, 0, 8),
     )
-    def test_num_cores_bit_identical(self, seq_lens, n_decode, n_prefill):
+    def test_num_cores_bit_identical(self,
+                                     seq_lens,
+                                     n_decode,
+                                     n_prefill,
+                                     shared_prefix_pages=0):
         """The same inputs on 1 and 2 cores give the same output and cache,
-        bit for bit, for every core split."""
+        bit for bit, for every core split, with and without the cache update
+        (with update_kv_cache=False the cache must come back unchanged)."""
         if not jtu.is_device_tpu_at_least(version=5):
             self.skipTest("Expect TPUv5+")
         for kv_dtype, heads in ((jnp.float8_e4m3fn, (16, 4)),
                                 (jnp.float8_e4m3fn, (8, 2)), (jnp.bfloat16,
                                                               (16, 4))):
-            kwargs = dict(sm_scale=128**-0.5)
-            if n_prefill:
-                kwargs["chunk_prefill_size"] = 4
-            args = lambda: self._core_split_inputs(  # noqa: E731
-                seq_lens, n_decode, n_prefill, heads, kv_dtype)
-            ref_out, ref_cache = ragged_paged_attention(*args(),
-                                                        num_cores=1,
-                                                        **kwargs)
-            ntok = int(sum(q for q, _ in seq_lens))
-            for split in ("seq", "kv_head", "auto"):
-                with self.subTest(kv_dtype=jnp.dtype(kv_dtype).name,
-                                  heads=heads,
-                                  split=split):
-                    out, cache = ragged_paged_attention(*args(),
-                                                        num_cores=2,
-                                                        core_split=split,
-                                                        **kwargs)
-                    self.assertArraysEqual(out[:ntok], ref_out[:ntok])
-                    self.assertArraysEqual(cache, ref_cache)
+            for update_kv_cache in (True, False):
+                kwargs = dict(sm_scale=128**-0.5,
+                              update_kv_cache=update_kv_cache)
+                if n_prefill:
+                    kwargs["chunk_prefill_size"] = 4
+                args = lambda: self._core_split_inputs(  # noqa: E731
+                    seq_lens,
+                    n_decode,
+                    n_prefill,
+                    heads,
+                    kv_dtype,
+                    shared_prefix_pages=shared_prefix_pages)
+                ref_out, ref_cache = ragged_paged_attention(*args(),
+                                                            num_cores=1,
+                                                            **kwargs)
+                if not update_kv_cache:
+                    self.assertArraysEqual(ref_cache, args()[3])
+                ntok = int(sum(q for q, _ in seq_lens))
+                for split in ("seq", "kv_head", "auto"):
+                    with self.subTest(kv_dtype=jnp.dtype(kv_dtype).name,
+                                      heads=heads,
+                                      update_kv_cache=update_kv_cache,
+                                      split=split):
+                        out, cache = ragged_paged_attention(*args(),
+                                                            num_cores=2,
+                                                            core_split=split,
+                                                            **kwargs)
+                        self.assertArraysEqual(out[:ntok], ref_out[:ntok])
+                        self.assertArraysEqual(cache, ref_cache)
 
     # TODO: support integer (int8, int4) and fp4 kv cache
     @parameterized.product(

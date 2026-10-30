@@ -1791,6 +1791,8 @@ def ragged_paged_attention(
     ) = q.shape
     page_size = kv_cache.shape[1]
     num_kv_heads_x2_per_kv_packing = kv_cache.shape[2]
+    if not isinstance(num_cores, int) or num_cores <= 0:
+        raise ValueError(f"{num_cores=} must be a positive integer.")
     if core_split not in ("seq", "kv_head", "auto"):
         raise ValueError(f"{core_split=} must be 'seq', 'kv_head' or 'auto'.")
     # Each core takes whole kv heads AND whole packs of the cache's packed
