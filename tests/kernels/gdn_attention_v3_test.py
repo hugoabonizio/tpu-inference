@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -275,6 +277,8 @@ def gdn_attention_spec_ref(
 
 class GDNAttentionTest(parameterized.TestCase):
 
+    COMPACT_CONV_STATE = False
+
     @parameterized.named_parameters(
         dict(
             testcase_name="prefill",
@@ -390,7 +394,8 @@ class GDNAttentionTest(parameterized.TestCase):
                                     axis=-1)
 
         gdn_attention_jitted = jax.jit(
-            wrapper.fused_conv1d_gdn,
+            functools.partial(wrapper.fused_conv1d_gdn,
+                              compact_conv_state=self.COMPACT_CONV_STATE),
             static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
         )
 
@@ -525,7 +530,8 @@ class GDNAttentionTest(parameterized.TestCase):
                              dtype=jnp.int32)
 
         run_jitted = jax.jit(
-            wrapper.fused_conv1d_gdn,
+            functools.partial(wrapper.fused_conv1d_gdn,
+                              compact_conv_state=self.COMPACT_CONV_STATE),
             static_argnames=[
                 "n_kq", "n_v", "d_k", "d_v", "kernel_size", "num_spec_tokens"
             ],
@@ -691,7 +697,8 @@ class GDNAttentionTest(parameterized.TestCase):
         mixed_qkv = jnp.concatenate([query, key, value], axis=-1)
 
         run_jitted = jax.jit(
-            wrapper.fused_conv1d_gdn,
+            functools.partial(wrapper.fused_conv1d_gdn,
+                              compact_conv_state=self.COMPACT_CONV_STATE),
             static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
         )
 
@@ -803,7 +810,8 @@ class GDNAttentionTest(parameterized.TestCase):
             (num_blocks, n_v, kq_head_dim, v_head_dim))
 
         run_jitted = jax.jit(
-            wrapper.fused_conv1d_gdn,
+            functools.partial(wrapper.fused_conv1d_gdn,
+                              compact_conv_state=self.COMPACT_CONV_STATE),
             static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
         )
         common_static = dict(
@@ -917,7 +925,8 @@ class GDNAttentionTest(parameterized.TestCase):
             (num_blocks, n_v, kq_head_dim, v_head_dim))
 
         run_jitted = jax.jit(
-            wrapper.fused_conv1d_gdn,
+            functools.partial(wrapper.fused_conv1d_gdn,
+                              compact_conv_state=self.COMPACT_CONV_STATE),
             static_argnames=["n_kq", "n_v", "d_k", "d_v", "kernel_size"],
         )
         common_static = dict(
@@ -995,3 +1004,9 @@ class GDNAttentionTest(parameterized.TestCase):
         self.assertTrue(
             np.any(np.asarray(rec_after_b[write_slot]) != 0.0),
             "write_slot should hold the step's final recurrent state")
+
+
+class GDNAttentionCompactConvStateTest(GDNAttentionTest):
+    """Reruns every case on a compact copy of the conv state cache."""
+
+    COMPACT_CONV_STATE = True

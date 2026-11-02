@@ -157,6 +157,12 @@ class MetadataRef:
     # cached state block of the previous block boundary and checkpoints into
     # a different block (see `cache_config.mamba_cache_mode == "align"`).
     s_idx_to_read_indices: Any
+    # Conv state slots, addressed independently of the recurrent state so the
+    # wrapper can run the kernel on a compact copy of the conv state cache
+    # (see `wrapper.fused_conv1d_gdn`). The read slot already includes the
+    # read offset; checkpoints are written from the write slot onwards.
+    s_idx_to_conv_read_indices: Any
+    s_idx_to_conv_state_indices: Any
     shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
 
     def get_record(self, p_id, idx) -> PackedPIdRecord:
@@ -179,6 +185,8 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_read_indices: jax.Array,
+        s_idx_to_conv_read_indices: jax.Array,
+        s_idx_to_conv_state_indices: jax.Array,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -213,6 +221,8 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_read_indices=s_idx_to_read_indices,
+            s_idx_to_conv_read_indices=s_idx_to_conv_read_indices,
+            s_idx_to_conv_state_indices=s_idx_to_conv_state_indices,
             shape=shape,
         )
 
@@ -357,6 +367,14 @@ class StateBufferedRef(BaseBufferedRef):
     `state_indices[s]`.
     """
 
+    def read_slot(self, s_idx: jax.Array) -> jax.Array:
+        # Resume from the checkpoint of the last accepted token.
+        return (self.metadata_ref.s_idx_to_read_indices[s_idx] +
+                self.metadata_ref.s_idx_to_read_offset[s_idx])
+
+    def write_slot(self, s_idx: jax.Array) -> jax.Array:
+        return self.metadata_ref.s_idx_to_state_indices[s_idx]
+
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -369,14 +387,11 @@ class StateBufferedRef(BaseBufferedRef):
             record = self.metadata_ref.get_record(p_id, idx)
             is_first_tile = record.is_first_tile
             s_idx = record.s_idx
-            state_idx = self.metadata_ref.s_idx_to_read_indices[s_idx]
+            state_idx = self.read_slot(s_idx)
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[
                 s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             dma_size = jnp.where(should_read, 1, 0)
-
-            # Resume from the checkpoint of the last accepted token.
-            state_idx += self.metadata_ref.s_idx_to_read_offset[s_idx]
 
             pltpu.make_async_copy(
                 src_ref.at[pl.ds(state_idx, dma_size)],
@@ -421,7 +436,7 @@ class StateBufferedRef(BaseBufferedRef):
             is_last_tile = record.is_last_tile
             s_idx = record.s_idx
             r_size = record.r_size
-            state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
+            state_idx = self.write_slot(s_idx)
             # Write one checkpoint per valid window position, starting at the
             # group's base slot. `r_size` never exceeds `window_size` for
             # windowed sequences; the clamp is for PER_SEQ tiles, which hold
@@ -456,6 +471,18 @@ class StateBufferedRef(BaseBufferedRef):
         # to wait for the same number of bytes `copy_out` issued.
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ConvStateBufferedRef(StateBufferedRef):
+    """StateBufferedRef addressed by the conv-specific slot indices."""
+
+    def read_slot(self, s_idx: jax.Array) -> jax.Array:
+        return self.metadata_ref.s_idx_to_conv_read_indices[s_idx]
+
+    def write_slot(self, s_idx: jax.Array) -> jax.Array:
+        return self.metadata_ref.s_idx_to_conv_state_indices[s_idx]
 
 
 def create_allocs(
@@ -530,16 +557,17 @@ def create_allocs(
 
     conv_spec = block_spec_partial(block_shape=conv_shape)
     recurrent_spec = block_spec_partial(block_shape=recurrent_shape)
-    state_buffered_partial = functools.partial(
-        StateBufferedRef.input_output,
+    state_buffered_kwargs = dict(
         buffer_count=pipeline_mode.buffer_count,
         use_lookahead=pipeline_mode.use_lookahead,
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    conv_alloc = state_buffered_partial(spec=conv_spec,
-                                        dtype_or_type=conv_state_ref)
-    recurrent_alloc = state_buffered_partial(spec=recurrent_spec,
-                                             dtype_or_type=recurrent_state_ref)
+    conv_alloc = ConvStateBufferedRef.input_output(
+        spec=conv_spec, dtype_or_type=conv_state_ref, **state_buffered_kwargs)
+    recurrent_alloc = StateBufferedRef.input_output(
+        spec=recurrent_spec,
+        dtype_or_type=recurrent_state_ref,
+        **state_buffered_kwargs)
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc
